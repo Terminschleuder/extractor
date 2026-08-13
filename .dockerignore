@@ -1,0 +1,19 @@
+# Keep the prod image small and free of dev-only noise.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.gitignore
+.env
+.env.example
+*.md
+tests/
+docs/
+Dockerfile
+.dockerignore
+docker-compose.yml
+start.sh
+pyproject.toml
+requirements-dev.txt

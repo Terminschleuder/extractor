@@ -1,0 +1,25 @@
+# Run the extractor as a long-lived service.
+# `./start.sh` wraps `docker compose up --build`. Provide secrets via .env
+# (copy .env.example). From the container, a host-side Ollama is reachable at
+# http://host.docker.internal:11434/v1 (add host-gateway below, already done).
+services:
+  extractor:
+    build: .
+    image: terminschleuder-extractor:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Safe in-container defaults; .env overrides with real secrets.
+      EXTRACTOR_LOG_FORMAT: json
+      # Persist per-source crawl timestamps to the mounted volume.
+      EXTRACTOR_STATE_FILE: /app/state/crawl_state.json
+    # Reach a host-side Ollama from the container on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Persist per-source crawl timestamps across restarts.
+    volumes:
+      - extractor-state:/app/state
+
+volumes:
+  extractor-state:

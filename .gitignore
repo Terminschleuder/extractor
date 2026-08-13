@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenv (host dev only)
+.venv/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets / state — never commit
+.env
+state/
+*.state.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
