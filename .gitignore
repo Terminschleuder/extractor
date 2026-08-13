@@ -17,6 +17,8 @@ htmlcov/
 
 # Local secrets / state — never commit
 .env
+demo.env
+*.env.local
 state/
 *.state.json
 
