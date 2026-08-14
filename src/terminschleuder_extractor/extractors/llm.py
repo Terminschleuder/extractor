@@ -6,18 +6,30 @@ structured JSON via a forced function tool call (``extract_events``). The model
 output is **untrusted**: every item is validated with pydantic and bad items
 are dropped with a WARNING — one malformed event never crashes a whole source.
 
+Two-phase extraction (general, site-agnostic):
+  1. *Listing pass* — extract every event from the source page itself. The
+     cleaned text inlines anchor hrefs as ``text [URL]`` so the model can
+     return each event's own detail-page URL in its ``url`` field.
+  2. *Detail pass* — for events whose ``url`` is a distinct page, fetch that
+     page and run a focused single-event extraction to recover the time of day,
+     full venue/address, coordinates, and description that usually only appear
+     on the detail page. Detail fields (non-empty) override the listing values;
+     a failed detail fetch leaves the listing event intact. Bounded by
+     ``max_detail_pages_per_source`` (0 disables it).
+
 Provider portability: we point the ``openai`` SDK at a configurable
 ``base_url`` (local Ollama by default; any OpenAI-compatible endpoint works).
 We do **not** set ``strict: True`` on the tool schema (many compatible backends
 ignore it) and we keep a content-JSON fallback for models that emit the events
 in the message body instead of via a tool call (common with small Ollama
-models). No agentic loop — one forced call, parse, done.
+models). No agentic loop — forced calls, parse, done.
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import urljoin, urldefrag
 
 import httpx
 from bs4 import BeautifulSoup
@@ -51,30 +63,60 @@ _EVENT_OBJECT_SCHEMA: dict[str, Any] = {
         "title": {"type": "string", "description": "Event title (required)."},
         "starts_at": {
             "type": "string",
-            "description": "Start datetime in ISO-8601, e.g. 2025-09-15T19:00:00.",
+            "description": (
+                "Start datetime in ISO-8601, INCLUDING the time of day when "
+                "shown, e.g. 2025-09-15T19:00:00. If only a date is known, "
+                "use 2025-09-15T00:00:00. Preserve timezone offset if shown."
+            ),
         },
         "ends_at": {
             "type": ["string", "null"],
-            "description": "Optional end datetime in ISO-8601.",
+            "description": (
+                "End datetime in ISO-8601 with time of day if known. For a "
+                "date range 'A - B', starts_at=A and ends_at=B."
+            ),
         },
-        "description": {"type": ["string", "null"], "description": "Optional description."},
-        "url": {"type": ["string", "null"], "description": "Canonical event URL if shown."},
+        "description": {
+            "type": ["string", "null"],
+            "description": "Short summary/description if present on the page.",
+        },
+        "url": {
+            "type": ["string", "null"],
+            "description": (
+                "This event's own detail-page URL when the page links to one "
+                "(shown in the text as `link text [URL]`). Use that [URL]. "
+                "Do NOT use the source page URL. Omit if the event has no "
+                "distinct page."
+            ),
+        },
         "platform": {"type": ["string", "null"], "description": "Observed platform/site name."},
         "attendance_mode": {
             "type": "string",
             "enum": [e.value for e in AttendanceMode],
-            "description": "physical | online | hybrid.",
+            "description": "physical | online | hybrid. Infer from the page; default physical.",
         },
         "event_type": {
             "type": "string",
             "enum": [e.value for e in EventType],
-            "description": "meetup | conference | workshop | social | other.",
+            "description": (
+                "meetup | conference | workshop | social | other. Map the "
+                "page's category/label to the closest value (e.g. "
+                "conference/Konferenz -> conference, workshop -> workshop, "
+                "a casual gathering -> social or meetup). Use `other` only "
+                "if nothing fits."
+            ),
         },
-        "venue_name": {"type": ["string", "null"]},
-        "venue_address": {"type": ["string", "null"]},
-        "venue_city": {"type": ["string", "null"]},
-        "latitude": {"type": ["number", "null"], "description": "Decimal degrees."},
-        "longitude": {"type": ["number", "null"], "description": "Decimal degrees."},
+        "venue_name": {
+            "type": ["string", "null"],
+            "description": "Venue/building/organizer location name if shown.",
+        },
+        "venue_address": {
+            "type": ["string", "null"],
+            "description": "Street + number + postal code if shown.",
+        },
+        "venue_city": {"type": ["string", "null"], "description": "City/town if shown."},
+        "latitude": {"type": ["number", "null"], "description": "Decimal degrees if coordinates appear."},
+        "longitude": {"type": ["number", "null"], "description": "Decimal degrees if coordinates appear."},
     },
     "required": ["title", "starts_at"],
 }
@@ -84,9 +126,10 @@ EXTRACT_EVENTS_TOOL: dict[str, Any] = {
     "function": {
         "name": "extract_events",
         "description": (
-            "Extract all upcoming events listed on the page as a list of event "
-            "objects. Call this tool exactly once with every event you can find. "
-            "If there are no events, return an empty list."
+            "Extract events from the page as a list of event objects. On a "
+            "listing page, return every event shown; on a single-event detail "
+            "page, return that one event. Call this tool exactly once. If there "
+            "are no events, return an empty list."
         ),
         "parameters": {
             "type": "object",
@@ -102,26 +145,74 @@ EXTRACT_EVENTS_TOOL: dict[str, Any] = {
     },
 }
 
-_SYSTEM_PROMPT = """\
+# Listing pass: the source page may be a single event or a list of many.
+_LISTING_SYSTEM_PROMPT = """\
 You are an event extraction engine for the terminschleuder event directory.
 You are given the cleaned text of a web page (plus any JSON-LD blocks) and the
-page URL. Extract every upcoming event you can find and return them via the
-`extract_events` tool.
+page URL. The page is either a single event's page or a listing of many events.
+Extract every upcoming event you can find and return them via the `extract_events`
+tool.
+
+Links: anchor links appear as `link text [URL]`, where [URL] is the link's
+absolute destination. When an event has its own detail page linked from this
+page, set that event's `url` to that detail page's [URL]. Do NOT set `url` to
+the source page URL itself. If an event has no distinct page, omit `url`.
 
 Rules:
 - Return ONLY events that have at least a title and a start datetime. If you
   cannot confidently determine either, omit the event.
-- `starts_at` and `ends_at` must be ISO-8601 strings with timezone or local
-  time as shown on the page (e.g. "2025-09-15T19:00:00").
-- `attendance_mode` is one of: physical, online, hybrid. Infer from the page;
-  default to physical if unclear.
-- `event_type` is one of: meetup, conference, workshop, social, other. Choose
-  the best fit; default to other.
-- `latitude`/`longitude` are decimal degrees if a venue location is available;
-  otherwise omit them. Send them as separate numbers.
-- `url` is the event's own page if distinct from the source URL; otherwise omit.
+- `starts_at`/`ends_at` are ISO-8601. Capture the TIME OF DAY when shown and
+  combine date + time into one timestamp, e.g. "2025-09-15T19:00:00". If only a
+  date is shown, use that date at midnight, e.g. "2025-09-15T00:00:00". Preserve
+  the timezone/offset as shown; if none is shown, use local naive time.
+- Recognize common date formats on the page (e.g. 15.09.2025, 09/15/2025,
+  15 September 2025, 2025-09-15) and normalize to ISO-8601. For a date range
+  "A - B", set starts_at=A and ends_at=B.
+- `venue_name`: the venue/building/organizer location name if shown.
+- `venue_address`: street + number + postal code if shown.
+- `venue_city`: the city/town if shown.
+- `latitude`/`longitude`: decimal degrees if coordinates appear; otherwise omit.
+  Send them as separate numbers.
+- `description`: a short summary if the page has one; otherwise omit.
+- `attendance_mode`: physical | online | hybrid. Infer from clues (a physical
+  venue, or "Online"/"Hybrid"/"Zoom"/"remote"); default physical.
+- `event_type`: meetup | conference | workshop | social | other. Map the page's
+  category/label to the closest value (e.g. conference/Konferenz -> conference,
+  workshop -> workshop, a casual/regular gathering -> social or meetup). Use
+  `other` only if nothing fits.
+- `platform`: the site/platform name if known; otherwise omit.
 - If the page lists no events at all, return an empty `events` array.
 - Do not invent events. Do not include past events. Do not include duplicates.
+"""
+
+# Detail pass: a single event's own page. Focus on fields that usually only
+# appear here (exact time, full venue, coordinates, description).
+_DETAIL_SYSTEM_PROMPT = """\
+You are an event extraction engine for the terminschleuder event directory.
+You are given the cleaned text of a SINGLE event's detail page (plus any
+JSON-LD blocks) and its URL. Extract THAT ONE event with its full details and
+return it via the `extract_events` tool (a list with one event, or an empty list
+if this page is not an event).
+
+Focus on the fields that usually only appear on the detail page:
+- Exact `starts_at`/`ends_at` INCLUDING the time of day, as ISO-8601 (e.g.
+  "2025-09-15T09:00:00"). Combine date + time. For a range, starts_at is the
+  start and ends_at is the end. Preserve the timezone/offset as shown; if none
+  is shown, use local naive time. Recognize common date/time formats (e.g.
+  15.09.2026, 09:00 - 21.08.2026, 18:00) and normalize to ISO-8601.
+- `venue_name`, `venue_address` (street + number + postal code), `venue_city`.
+- `latitude`/`longitude` (decimal degrees) if coordinates appear.
+- `description`: a short summary from the page.
+- `attendance_mode` (physical | online | hybrid) and `event_type`
+  (meetup | conference | workshop | social | other), mapped from the page's
+  category/label as in the listing pass.
+- `title` if shown on this page.
+
+Rules:
+- Return AT MOST the one event this page is about. Do not pull in unrelated or
+  "related events" listed elsewhere on the page.
+- If the page is not an event detail page, return an empty `events` array.
+- Do not invent information not present on the page.
 """
 
 
@@ -163,8 +254,17 @@ class LLMExtractor(Extractor):
         return resp.text
 
     # --- HTML cleaning ---
-    def _clean_html(self, html: str) -> tuple[str, list[str]]:
-        """Return (visible_text, jsonld_blocks). Strips noise tags + trims length."""
+    def _clean_html(
+        self, html: str, *, source_url: str = "", preserve_links: bool = True
+    ) -> tuple[str, list[str]]:
+        """Return (visible_text, jsonld_blocks). Strips noise tags + trims length.
+
+        When ``preserve_links`` is set, anchor hrefs are resolved against
+        ``source_url`` and inlined into the text as ``link text [URL]`` so the
+        model can see and return per-event detail URLs (``get_text`` otherwise
+        drops hrefs entirely). Noise tags (nav/footer/script/...) are removed
+        first, so only content-area links are kept.
+        """
         soup = BeautifulSoup(html, "html.parser")
 
         # Collect JSON-LD blocks *before* stripping scripts (JSON-LD lives in
@@ -176,6 +276,22 @@ class LLMExtractor(Extractor):
 
         for tag in soup(list(_NOISE_TAGS)):
             tag.decompose()
+
+        if preserve_links:
+            # Inline absolute hrefs as `text [URL]`. Mutating the anchor's
+            # content (replacing children with a single string) is enough — we
+            # only read the tree via get_text afterwards.
+            for a in soup.find_all("a", href=True):
+                label = a.get_text(" ", strip=True)
+                if not label:
+                    continue
+                href = a["href"].strip()
+                if not href or href.startswith("#"):
+                    continue
+                absolute = urljoin(source_url, href) if source_url else href
+                # Drop fragments; they don't identify a distinct page.
+                absolute, _ = urldefrag(absolute)
+                a.string = f"{label} [{absolute}]"
 
         text = soup.get_text(separator="\n", strip=True)
         # Collapse blank lines for a denser prompt.
@@ -256,34 +372,40 @@ class LLMExtractor(Extractor):
         log = self._log.bind(source_id=source.id, url=source.url)
         log.debug("fetching_source", platform=source.platform)
         html = self._fetch_html(source.url)
-        text, jsonld = self._clean_html(html)
+        text, jsonld = self._clean_html(html, source_url=source.url, preserve_links=True)
         log.debug("page_cleaned", chars=len(text), jsonld_blocks=len(jsonld))
 
-        user_parts = [
-            f"Source URL: {source.url}",
-            f"Platform: {source.platform or 'unknown'}",
-            "",
-            "Page text:",
-            text,
-        ]
-        if jsonld:
-            user_parts += ["", "JSON-LD blocks:", *jsonld]
-        user_message = "\n".join(user_parts)
+        user_message = self._build_user_message(
+            source.url, source.platform, text, jsonld
+        )
 
-        self._call_model(_SYSTEM_PROMPT, user_message)
+        # Phase 1 — listing pass: extract events from the source page itself.
+        self._call_model(_LISTING_SYSTEM_PROMPT, user_message)
         event_dicts = self._extract_events_list()
-        log.info("llm_extracted", raw_count=len(event_dicts), model=self._settings.llm_model)
+        log.info(
+            "llm_extracted",
+            phase="listing",
+            raw_count=len(event_dicts),
+            model=self._settings.llm_model,
+        )
 
+        # Phase 2 — detail pass: follow per-event detail links to recover the
+        # time of day, full venue/address, coordinates, and description that
+        # usually only appear on each event's own page. No-op when the source
+        # page is itself a single event (no distinct detail URLs).
+        event_dicts = self._enrich_with_details(event_dicts, source, log)
+
+        # Validate + build observations. We do NOT stamp `url` with the source
+        # URL: url is the event's own page (if any) or absent. Provenance is
+        # already carried by the `source` field.
         observations: list[ObservationSubmit] = []
         for idx, item in enumerate(event_dicts):
             if not isinstance(item, dict):
                 log.warning("dropping_non_object_event", index=idx)
                 continue
-            # Stamp provenance the model should not set.
             item = dict(item)
             item.setdefault("source", source.id)
             item.setdefault("platform", source.platform or None)
-            item.setdefault("url", source.url)
             try:
                 observations.append(ObservationSubmit.model_validate(item))
             except Exception as exc:  # pydantic.ValidationError or similar
@@ -295,6 +417,126 @@ class LLMExtractor(Extractor):
                 )
         log.info("events_validated", count=len(observations))
         return observations
+
+    # --- detail-link following ---
+    def _enrich_with_details(
+        self, events: list[Any], source: DueSource, log: Any
+    ) -> list[Any]:
+        """Follow distinct per-event detail URLs and merge detail fields in.
+
+        General and site-agnostic: the model decides which events have a detail
+        page (via the `url` it returned); we just fetch those URLs. Detail pages
+        that fail to fetch/parse leave the listing-level event intact (graceful
+        degradation). Bounded by ``max_detail_pages_per_source``.
+        """
+        max_detail = self._settings.max_detail_pages_per_source
+        if max_detail <= 0:
+            return events
+
+        source_url, _ = urldefrag(source.url)
+        followed = 0
+        # Cache of detail_url -> non-empty overrides from that detail page, so
+        # multiple listing events pointing at the same detail page share results.
+        cache: dict[str, dict[str, Any]] = {}
+        enriched: list[Any] = []
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                enriched.append(ev)
+                continue
+            detail_url = self._resolve_detail_url(ev.get("url"), source_url)
+            if not detail_url:
+                # Not a usable detail page (the model returned the source URL,
+                # a fragment, or junk). Drop the url so the observation stays
+                # honest — an event's url is its own page or absent.
+                enriched.append({k: v for k, v in ev.items() if k != "url"})
+                continue
+
+            if detail_url in cache:
+                enriched.append({**ev, **cache[detail_url], "url": detail_url})
+                continue
+            if followed >= max_detail:
+                log.debug("detail_skipped_cap", url=detail_url, cap=max_detail)
+                enriched.append({**ev, "url": detail_url})
+                continue
+
+            followed += 1
+            overrides = self._extract_detail(detail_url, source, log)
+            if overrides:
+                cache[detail_url] = overrides
+                enriched.append({**ev, **overrides, "url": detail_url})
+            else:
+                # Keep the listing event; still record its detail URL.
+                enriched.append({**ev, "url": detail_url})
+        if followed:
+            log.info("detail_pages_followed", count=followed, cap=max_detail)
+        return enriched
+
+    def _resolve_detail_url(self, url: Any, source_url: str) -> str | None:
+        """Return an absolute, fetchable detail URL distinct from the source page."""
+        if not isinstance(url, str):
+            return None
+        url = url.strip()
+        if not url or url.startswith("#"):
+            return None
+        absolute, _ = urldefrag(urljoin(source_url, url) if source_url else url)
+        if absolute == source_url:
+            return None  # never refetch the source page as a "detail" page
+        if not absolute.startswith(("http://", "https://")):
+            return None
+        return absolute
+
+    def _extract_detail(
+        self, detail_url: str, source: DueSource, log: Any
+    ) -> dict[str, Any] | None:
+        """Fetch one detail page and extract a single event's full fields.
+
+        Returns the non-empty fields from the detail page (to merge over the
+        listing event), or None if the page can't be fetched or isn't an event.
+        """
+        dlog = log.bind(detail_url=detail_url)
+        try:
+            html = self._fetch_html(detail_url)
+        except FetchError as exc:
+            dlog.warning("detail_fetch_failed", error=str(exc))
+            return None
+        # Don't inline links on a detail page: it may list "related events" and
+        # we don't want the model chasing them — we only want this one event.
+        text, jsonld = self._clean_html(html, source_url=detail_url, preserve_links=False)
+        dlog.debug("detail_page_cleaned", chars=len(text), jsonld_blocks=len(jsonld))
+
+        user_message = self._build_user_message(detail_url, source.platform, text, jsonld)
+        self._call_model(_DETAIL_SYSTEM_PROMPT, user_message)
+        event_dicts = self._extract_events_list()
+        if not event_dicts:
+            dlog.info("detail_no_event")
+            return None
+        # The detail page is about one event; take the first well-formed object.
+        detail = event_dicts[0]
+        if not isinstance(detail, dict):
+            return None
+        dlog.info("detail_extracted", title=detail.get("title"))
+        # Only non-empty values override the listing event; drop empties/None.
+        return {
+            k: v
+            for k, v in detail.items()
+            if v not in (None, "") and k != "url"  # url is set by the caller
+        }
+
+    # --- prompt assembly ---
+    def _build_user_message(
+        self, url: str, platform: str | None, text: str, jsonld: list[str]
+    ) -> str:
+        parts = [
+            f"Page URL: {url}",
+            f"Platform: {platform or 'unknown'}",
+            "",
+            "Page text:",
+            text,
+        ]
+        if jsonld:
+            parts += ["", "JSON-LD blocks:", *jsonld]
+        return "\n".join(parts)
 
 
 # --- helpers ---

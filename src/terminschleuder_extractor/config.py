@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = Field(30.0, gt=0)
     user_agent: str = "terminschleuder-extractor/0.1"
     max_page_chars: int = Field(20000, ge=1000)
+    # Max per-event detail pages to follow per source. When a source page is a
+    # listing that links to individual event pages, the extractor fetches each
+    # detail page to recover time-of-day / full venue / description that only
+    # appear there. 0 disables detail following (listing-only extraction).
+    max_detail_pages_per_source: int = Field(10, ge=0)
 
     # --- OpenAI-compatible LLM endpoint ---
     llm_base_url: str = "http://localhost:11434/v1"
