@@ -28,6 +28,7 @@ models). No agentic loop — forced calls, parse, done.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin, urldefrag
 
@@ -36,6 +37,12 @@ from bs4 import BeautifulSoup
 
 from ..config import Settings
 from ..errors import FetchError, LlmError
+from ..feeds import (
+    discover_feed_urls,
+    fill_time_params,
+    filter_upcoming,
+    parse_calendar,
+)
 from ..logging_setup import get_logger
 from ..models import AttendanceMode, DueSource, EventType, ObservationSubmit
 from .base import Extractor, register
@@ -253,6 +260,26 @@ class LLMExtractor(Extractor):
             raise FetchError(f"fetch {url} returned HTTP {resp.status_code}")
         return resp.text
 
+    def _fetch_text(self, url: str) -> tuple[str | None, str | None]:
+        """Soft fetch used by feed discovery/parse: returns (text, content_type)
+        or (None, None) on any failure. Never raises — a missing feed is fine."""
+        client = self._http_client or httpx.Client(
+            headers={"User-Agent": self._settings.user_agent},
+            timeout=self._settings.http_timeout_seconds,
+            follow_redirects=True,
+        )
+        owns = self._http_client is None
+        try:
+            resp = client.get(url)
+        except httpx.HTTPError:
+            return None, None
+        finally:
+            if owns:
+                client.close()
+        if resp.status_code >= 400:
+            return None, None
+        return resp.text, resp.headers.get("content-type", "")
+
     # --- HTML cleaning ---
     def _clean_html(
         self, html: str, *, source_url: str = "", preserve_links: bool = True
@@ -375,19 +402,32 @@ class LLMExtractor(Extractor):
         text, jsonld = self._clean_html(html, source_url=source.url, preserve_links=True)
         log.debug("page_cleaned", chars=len(text), jsonld_blocks=len(jsonld))
 
-        user_message = self._build_user_message(
-            source.url, source.platform, text, jsonld
-        )
-
         # Phase 1 — listing pass: extract events from the source page itself.
-        self._call_model(_LISTING_SYSTEM_PROMPT, user_message)
-        event_dicts = self._extract_events_list()
+        event_dicts = self._run_listing(source.url, source.platform, text, jsonld)
         log.info(
             "llm_extracted",
             phase="listing",
             raw_count=len(event_dicts),
             model=self._settings.llm_model,
         )
+
+        # Feed fallback — JS-rendered pages may have no events in the static
+        # HTML. Discover the site's event-data feed (calendar link tags + a
+        # bounded scan of scripts), parse it directly (jcal/iCal) or via the
+        # LLM (RSS/JSON/HTML), and merge the events with the listing results.
+        # Always attempted (per design choice): merge with listing output and
+        # accept the dedup risk — dedup is by title + start date.
+        if self._settings.discover_feeds:
+            feed_events = self._discover_and_extract_feeds(html, source, log)
+            if feed_events:
+                before = len(event_dicts)
+                event_dicts = self._merge_events(event_dicts, feed_events)
+                log.info(
+                    "feed_merged",
+                    listing=before,
+                    feed=len(feed_events),
+                    merged=len(event_dicts),
+                )
 
         # Phase 2 — detail pass: follow per-event detail links to recover the
         # time of day, full venue/address, coordinates, and description that
@@ -417,6 +457,117 @@ class LLMExtractor(Extractor):
                 )
         log.info("events_validated", count=len(observations))
         return observations
+
+    def _run_listing(
+        self, url: str, platform: str | None, text: str, jsonld: list[str]
+    ) -> list[dict[str, Any]]:
+        """Listing pass: call the model on a page's text and return event dicts."""
+        user_message = self._build_user_message(url, platform, text, jsonld)
+        self._call_model(_LISTING_SYSTEM_PROMPT, user_message)
+        return self._extract_events_list()
+
+    # --- feed fallback ---
+    def _discover_and_extract_feeds(
+        self, html: str, source: DueSource, log: Any
+    ) -> list[dict[str, Any]]:
+        """Discover the source's event-data feed(s) and parse events from it.
+
+        General/site-agnostic. Calendar feeds (jcal/iCal) are parsed directly;
+        anything else (RSS/JSON/HTML) is handed to the LLM listing pass. Events
+        are de-duplicated against the listing output by the caller. Soft-fails:
+        a missing or unparseable feed yields [].
+        """
+        feed_urls = discover_feed_urls(
+            html,
+            source.url,
+            self._fetch_text,
+            max_scripts=self._settings.max_feed_discovery_scripts,
+        )
+        if not feed_urls:
+            return []
+        log.debug("feed_candidates", urls=feed_urls)
+
+        now = datetime.now(timezone.utc)
+        window = timedelta(days=self._settings.feed_window_days)
+        max_events = self._settings.max_feed_events
+        # Non-calendar feeds (RSS/Atom/JSON/HTML) deferred to the LLM pass below.
+        non_calendar: list[tuple[str, str, str]] = []  # (filled_url, content, ctype)
+
+        # Pass 1 — direct-parse calendar feeds (jcal/iCal). These are lossless
+        # (no model in the loop) and therefore preferred over RSS/HTML, so we
+        # return the first one that yields upcoming events.
+        for feed_url in feed_urls:
+            filled = fill_time_params(feed_url, now, window)
+            content, ctype = self._fetch_text(filled)
+            if content is None:
+                continue
+            parsed = parse_calendar(content, ctype or "")
+            if parsed is None:
+                non_calendar.append((filled, content, ctype or ""))
+                continue
+            upcoming = filter_upcoming(parsed, now)
+            log.info("feed_parsed", kind="calendar", url=filled, count=len(upcoming))
+            if upcoming:
+                return upcoming[:max_events]
+            # calendar parsed but only past events -> keep looking
+
+        # Pass 2 — non-calendar feeds via the LLM listing pass (first non-empty wins).
+        for filled, content, _ctype in non_calendar:
+            trimmed = content[: self._settings.max_page_chars]
+            parsed = self._run_listing(filled, source.platform, trimmed, [])
+            log.info("feed_parsed_via_llm", url=filled, count=len(parsed))
+            if parsed:
+                return parsed[:max_events]
+        return []
+
+    # --- merge feed events with listing events ---
+    def _merge_events(
+        self, listing: list[Any], feed: list[Any]
+    ) -> list[Any]:
+        """Merge feed events into listing events, de-duplicating by title + date.
+
+        Key is (lowercased title prefix, start-date string). On a duplicate, the
+        richer record (more populated fields) wins — a feed event with full
+        time/venue replaces a listing stub, and vice-versa. Feed events are
+        always appended for the ones not already present, so a JS-only page
+        (empty listing) is fully covered by its feed.
+        """
+        merged: list[Any] = list(listing)
+        keys: dict[tuple[str, str], int] = {}
+        for i, e in enumerate(merged):
+            if isinstance(e, dict):
+                keys[self._event_key(e)] = i
+
+        for e in feed:
+            if not isinstance(e, dict):
+                continue
+            k = self._event_key(e)
+            if k in keys:
+                idx = keys[k]
+                existing = merged[idx]
+                if isinstance(existing, dict) and self._populated(e) > self._populated(existing):
+                    merged[idx] = e
+                continue
+            keys[k] = len(merged)
+            merged.append(e)
+        return merged
+
+    @staticmethod
+    def _event_key(e: dict[str, Any]) -> tuple[str, str]:
+        """Stable de-dup key: (title[:80].lower(), start date YYYY-MM-DD)."""
+        title = str(e.get("title") or "").strip().lower()[:80]
+        start = e.get("starts_at")
+        date = ""
+        if isinstance(start, datetime):
+            date = start.date().isoformat()
+        elif start:
+            date = str(start)[:10]
+        return (title, date)
+
+    @staticmethod
+    def _populated(e: dict[str, Any]) -> int:
+        """Count of non-empty fields — used to pick the richer record on dedup."""
+        return sum(1 for v in e.values() if v not in (None, "", []))
 
     # --- detail-link following ---
     def _enrich_with_details(

@@ -57,6 +57,22 @@ class Settings(BaseSettings):
     # appear there. 0 disables detail following (listing-only extraction).
     max_detail_pages_per_source: int = Field(10, ge=0)
 
+    # --- Feed fallback (JS-rendered pages) ---
+    # Some event sites render their calendar with JavaScript and the page HTML
+    # is just a skeleton; the real events live in a separate feed endpoint
+    # referenced only in a script. When enabled, the extractor also discovers
+    # and parses such feeds (calendar link tags + inline/external script scan)
+    # and merges the results with the LLM listing pass. General/site-agnostic.
+    discover_feeds: bool = True
+    # Max externally-linked .js files to fetch+scan for a feed URL per source.
+    max_feed_discovery_scripts: int = Field(3, ge=0)
+    # Upcoming-events window used to fill empty start/end params on feeds that
+    # expose an expandable calendar endpoint (now -> now + window).
+    feed_window_days: int = Field(180, ge=1)
+    # Cap on events accepted from a single feed (drops the rest, newest-first
+    # feeds thus keep the soonest).
+    max_feed_events: int = Field(100, ge=1)
+
     # --- OpenAI-compatible LLM endpoint ---
     llm_base_url: str = "http://localhost:11434/v1"
     llm_api_key: SecretStr = SecretStr("ollama")
