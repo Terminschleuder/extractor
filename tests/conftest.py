@@ -17,7 +17,11 @@ from terminschleuder_extractor.models import DueSource, OrganizationMini
 
 
 def _settings(**overrides: Any) -> Settings:
-    """Build Settings with the api key set and ``**overrides`` applied."""
+    """Build Settings with the api key set and ``**overrides`` applied.
+
+    ``_env_file=None`` isolates tests from any local ``.env`` (e.g. a demo.env
+    copy used for Docker) so the suite is hermetic regardless of cwd.
+    """
     base = {
         "api_key": "test-api-key",
         "llm_api_key": "test-llm-key",
@@ -26,7 +30,7 @@ def _settings(**overrides: Any) -> Settings:
         "poll_interval_seconds": 3600,
     }
     base.update(overrides)
-    return Settings(**base)
+    return Settings(_env_file=None, **base)
 
 
 @pytest.fixture

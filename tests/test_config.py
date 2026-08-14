@@ -9,7 +9,7 @@ from terminschleuder_extractor.errors import ConfigError
 
 
 def test_defaults():
-    s = Settings()
+    s = Settings(_env_file=None)
     assert s.run_mode == "loop"
     assert s.poll_interval_seconds == 3600
     assert s.min_source_interval_seconds == 3600
