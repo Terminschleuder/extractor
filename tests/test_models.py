@@ -18,6 +18,7 @@ from terminschleuder_extractor.models import (
 def _valid(**overrides):
     base = dict(
         source=42,
+        event_key="evt-1@rzl.de",
         title="PyGraten",
         starts_at=datetime(2025, 9, 15, 19, 0, 0),
     )
@@ -47,11 +48,25 @@ def test_to_api_minimal():
     assert payload["source"] == 42
     assert payload["title"] == "PyGraten"
     assert payload["starts_at"] == "2025-09-15T19:00:00"
+    # event_key is required and always emitted.
+    assert payload["event_key"] == "evt-1@rzl.de"
     # optionals omitted, status never sent, run omitted when None.
     assert "run" not in payload
     assert "status" not in payload
     assert "description" not in payload
     assert "latitude" not in payload
+
+
+def test_event_key_required():
+    with pytest.raises(ValidationError):
+        ObservationSubmit(
+            source=42, title="x", starts_at=datetime(2025, 1, 1)
+        )  # missing event_key
+
+
+def test_event_key_max_length():
+    with pytest.raises(ValidationError):
+        _valid(event_key="k" * 201)
 
 
 def test_to_api_includes_run_and_optionals():

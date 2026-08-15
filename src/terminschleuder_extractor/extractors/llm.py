@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from hashlib import sha1
 from typing import Any
 from urllib.parse import urljoin, urldefrag
 
@@ -435,6 +436,12 @@ class LLMExtractor(Extractor):
         # page is itself a single event (no distinct detail URLs).
         event_dicts = self._enrich_with_details(event_dicts, source, log)
 
+        # Compute a stable backend ``event_key`` per event and de-duplicate by it
+        # (keeping the richer record) so the backend's per-run unique constraint
+        # is never hit. This is the identity the backend reconciles run-over-run
+        # (uid for feed events, url for detail events, ``t:<hash>`` fallback).
+        event_dicts = self._dedup_by_event_key(event_dicts, source.id, log)
+
         # Validate + build observations. We do NOT stamp `url` with the source
         # URL: url is the event's own page (if any) or absent. Provenance is
         # already carried by the `source` field.
@@ -446,6 +453,10 @@ class LLMExtractor(Extractor):
             item = dict(item)
             item.setdefault("source", source.id)
             item.setdefault("platform", source.platform or None)
+            # ``uid`` is a feed-only intermediate identity consumed by
+            # ``_backend_event_key``; it is not a backend field (ObservationSubmit
+            # is extra-forbid), so drop it now that ``event_key`` is stamped.
+            item.pop("uid", None)
             try:
                 observations.append(ObservationSubmit.model_validate(item))
             except Exception as exc:  # pydantic.ValidationError or similar
@@ -568,6 +579,65 @@ class LLMExtractor(Extractor):
     def _populated(e: dict[str, Any]) -> int:
         """Count of non-empty fields — used to pick the richer record on dedup."""
         return sum(1 for v in e.values() if v not in (None, "", []))
+
+    # --- backend event_key (run-over-run identity) --------------------------
+    #
+    # Authoritative ids (iCal/jcal ``uid`` or detail-page ``url``) deliberately
+    # EXCLUDE the date: a postponed event keeps the same key, so the backend
+    # sees a date change on the same key as a POSTPONED. The ``t:<hash>``
+    # fallback (no uid/url) INCLUDES the date so recurring instances without a
+    # stable id stay distinct within a run (a title-only key would collide and
+    # crash the backend's per-run unique constraint); postpone detection for
+    # those is delegated to the backend fuzzy matcher.
+    @staticmethod
+    def _backend_event_key(ev: dict[str, Any], source_id: int) -> str:
+        """Stable per-event identity sent to the backend for reconciliation."""
+        uid = ev.get("uid")
+        if isinstance(uid, str) and uid.strip():
+            return uid.strip()[:200]
+        url = ev.get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()[:200]
+        title = str(ev.get("title") or "").strip().lower()
+        date = ""
+        s = ev.get("starts_at")
+        if isinstance(s, datetime):
+            date = s.date().isoformat()
+        elif s:
+            date = str(s)[:10]
+        digest = sha1(f"{title}|{source_id}|{date}".encode()).hexdigest()[:16]
+        return f"t:{digest}"
+
+    def _dedup_by_event_key(
+        self, events: list[Any], source_id: int, log: Any
+    ) -> list[dict[str, Any]]:
+        """Final de-dup by backend ``event_key``; stamp it on each survivor.
+
+        On a duplicate key the richer record (more populated fields) wins, so a
+        feed event with full venue/time replaces a listing stub. Guarantees the
+        backend's per-run ``(source, event_key, run)`` unique constraint is never
+        hit (the extractor never submits the same key twice in one run).
+        """
+        seen: dict[str, int] = {}
+        survivors: list[dict[str, Any]] = []
+        dropped = 0
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            key = self._backend_event_key(e, source_id)
+            e = dict(e)
+            e["event_key"] = key
+            if key in seen:
+                idx = seen[key]
+                if self._populated(e) > self._populated(survivors[idx]):
+                    survivors[idx] = e
+                dropped += 1
+            else:
+                seen[key] = len(survivors)
+                survivors.append(e)
+        if dropped:
+            log.info("event_key_dedup", dropped=dropped, kept=len(survivors))
+        return survivors
 
     # --- detail-link following ---
     def _enrich_with_details(

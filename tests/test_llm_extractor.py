@@ -88,6 +88,57 @@ def test_extract_happy_path(extractor, sample_source, make_tool_response, event_
     # url is the event's own page if the model returns one; when omitted it is
     # None (we never fake it to the source URL — provenance is in `source`).
     assert obs[0].url is None
+    # No url/uid -> event_key falls back to the ``t:<hash>`` identity, distinct
+    # per (title, source, date) and always set on every observation.
+    assert obs[0].event_key.startswith("t:")
+    assert obs[1].event_key.startswith("t:")
+    assert obs[0].event_key != obs[1].event_key
+
+
+@respx.mock
+def test_event_key_uses_url_when_present(settings_factory, sample_source, make_tool_response, event_dict):
+    """A listing event with its own detail URL uses that URL as the event_key —
+    the reschedule-stable identity for listing/detail sources."""
+    respx.get(sample_source.url).mock(return_value=respx.MockResponse(200, text=_page_html()))
+    # Detail following disabled so the event url isn't fetched (we test the key
+    # here, not detail enrichment).
+    ext = LLMExtractor(settings_factory(max_detail_pages_per_source=0))
+    events = [event_dict(url="https://example.com/events/e1")]
+    ext._llm_client = FakeLLM(make_tool_response(events=events))
+    obs = ext.extract(sample_source)
+    assert obs[0].event_key == "https://example.com/events/e1"
+
+
+@respx.mock
+def test_event_key_uses_uid_over_url(settings_factory, sample_source, make_tool_response, event_dict):
+    """When both a uid (feed identity) and url are present, uid wins — the
+    iCal/jcal uid is the authoritative, reschedule-stable identity."""
+    respx.get(sample_source.url).mock(return_value=respx.MockResponse(200, text=_page_html()))
+    ext = LLMExtractor(settings_factory(max_detail_pages_per_source=0))
+    events = [event_dict(uid="ical-uid-42", url="https://example.com/events/e1")]
+    ext._llm_client = FakeLLM(make_tool_response(events=events))
+    obs = ext.extract(sample_source)
+    assert obs[0].event_key == "ical-uid-42"
+
+
+@respx.mock
+def test_event_key_dedup_keeps_richer_record(settings_factory, sample_source, make_tool_response, event_dict):
+    """Two events sharing an event_key (same url) within one run are de-duped;
+    the richer record (more populated fields) survives. Guarantees the
+    backend's per-run unique ``(source, event_key, run)`` constraint is never hit."""
+    respx.get(sample_source.url).mock(return_value=respx.MockResponse(200, text=_page_html()))
+    ext = LLMExtractor(settings_factory(max_detail_pages_per_source=0))
+    events = [
+        event_dict(url="https://example.com/events/e1"),  # stub
+        event_dict(
+            url="https://example.com/events/e1",  # same key, richer
+            venue_name="Congress Centrum", venue_city="Bremen",
+        ),
+    ]
+    ext._llm_client = FakeLLM(make_tool_response(events=events))
+    obs = ext.extract(sample_source)
+    assert len(obs) == 1
+    assert obs[0].venue_city == "Bremen"  # the richer record won
 
 
 @respx.mock

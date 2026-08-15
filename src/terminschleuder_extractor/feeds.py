@@ -320,6 +320,10 @@ def _vevent_to_dict(props: dict[str, Any]) -> list[dict[str, Any]]:
             "venue_name": _scalar(props.get("location")) or None,
             "description": _scalar(props.get("description")) or None,
             "url": _scalar(props.get("url")) or None,
+            # The iCal/jcal ``uid`` is the authoritative, reschedule-stable event
+            # identity for feed-sourced events; the extractor promotes it to the
+            # ``event_key`` (see extractors/llm.py). Emitted even when absent (None).
+            "uid": _scalar(props.get("uid")) or None,
         }
     ]
 

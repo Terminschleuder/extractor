@@ -141,7 +141,8 @@ def test_submit_observations_bulk(client):
     from datetime import datetime
 
     obs = ObservationSubmit(
-        source=42, title="PyGraten", starts_at=datetime(2025, 9, 15, 19, 0, 0)
+        source=42, event_key="evt-1@rzl.de", title="PyGraten",
+        starts_at=datetime(2025, 9, 15, 19, 0, 0),
     )
     respx.post(f"{BASE}{OBSERVATIONS_BULK_PATH}").mock(
         return_value=respx.MockResponse(201, json=[{"id": 1}])
@@ -151,6 +152,7 @@ def test_submit_observations_bulk(client):
     body = respx.calls[0].request.read()
     assert b'"observations"' in body
     assert b'"source":42' in body
+    assert b'"event_key":"evt-1@rzl.de"' in body
     assert b'"status"' not in body  # we never send status
 
 

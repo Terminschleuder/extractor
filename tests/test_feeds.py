@@ -74,11 +74,13 @@ def test_parse_jcal_utc_and_date_only():
     assert e0["venue_name"] == "RaumZeitLabor"
     assert e0["description"] == "Weekly open night"
     assert e0["url"] is None  # uid is NOT used as a url
+    assert e0["uid"] == "evt-1@rzl.de"  # uid carried as the event identity
 
     # date-only -> midnight naive datetime
     e1 = events[1]
     assert e1["starts_at"] == datetime(2099, 9, 4, 0, 0)
     assert e1["starts_at"].tzinfo is None
+    assert e1["uid"] is None  # no uid on this vevent
 
 
 def test_parse_jcal_detected_by_content_without_content_type():
@@ -136,6 +138,7 @@ def test_parse_ical_unfolding_utc_date_and_url():
     # folded line unfolded: "abc" + "def"
     assert e0["description"] == "abcdef"
     assert e0["url"] == "https://rzl.de/events/1"
+    assert e0["uid"] == "evt-1@rzl.de"
 
     # VALUE=DATE date-only -> midnight naive
     e1 = events[1]

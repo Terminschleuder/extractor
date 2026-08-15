@@ -86,7 +86,10 @@ def test_gate_corrupt_state_file_ignored(tmp_path):
 
 def test_run_once_happy_path(settings, client, extractor):
     extractor.extract.return_value = [
-        ObservationSubmit(source=42, title="E", starts_at=datetime(2025, 9, 15, 19, 0, 0))
+        ObservationSubmit(
+            source=42, event_key="evt-1", title="E",
+            starts_at=datetime(2025, 9, 15, 19, 0, 0),
+        )
     ]
     runner = _make_runner(settings, client, extractor)
     code = runner.run_once()

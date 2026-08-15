@@ -101,6 +101,12 @@ class ObservationSubmit(BaseModel):
 
     source: int
     run: int | None = None
+    # Stable per-event identity for run-over-run reconciliation (see the backend
+    # ``events/reconciliation.py``): the iCal/jcal ``uid`` for feed events, the
+    # detail-page ``url`` for listing/detail events, or a ``t:<hash>`` fallback.
+    # The extractor always computes one (the fallback never yields empty), so it
+    # is required here; the backend still accepts blank for a partial deploy.
+    event_key: str = Field(..., min_length=1, max_length=200)
     title: str = Field(..., min_length=1, max_length=200)
     starts_at: datetime
     ends_at: datetime | None = None
@@ -127,6 +133,8 @@ class ObservationSubmit(BaseModel):
         payload: dict[str, Any] = {"source": self.source}
         if self.run is not None:
             payload["run"] = self.run
+        # event_key is required (never None); always emit it.
+        payload["event_key"] = self.event_key
         payload["title"] = self.title
         payload["starts_at"] = self.starts_at.isoformat()
         for field in (
