@@ -1,19 +1,32 @@
 version: 2
 updates:
+  # Runtime + test Python deps (requirements.txt / requirements-dev.txt).
+  # Target develop so bumps land on the develop branch (tested, no publish)
+  # and flow to main via a release PR — never publishing per-bump.
   - package-ecosystem: pip
     directory: "/"
+    target-branch: develop
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      production:
+        dependency-type: "production"
+      development:
+        dependency-type: "development"
 
+  # Base image (Dockerfile).
   - package-ecosystem: docker
     directory: "/"
+    target-branch: develop
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # SHA-pinned GitHub Actions (ci.yml).
   - package-ecosystem: github-actions
     directory: "/"
+    target-branch: develop
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
