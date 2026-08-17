@@ -22,6 +22,13 @@ COPY src/ ./src/
 RUN useradd --create-home --uid 1001 extractor \
     && mkdir -p /app/state \
     && chown -R extractor:extractor /app
+
+# OCI image metadata. CI (docker/metadata-action) appends source/revision/version.
+LABEL org.opencontainers.image.title="terminschleuder-extractor" \
+      org.opencontainers.image.description="LLM-based extractor for the terminschleuder ingestion API (OpenAI-compatible inference)" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="docker.io/library/python:3.14-slim-bookworm"
+
 USER extractor
 
 # Run the loop by default. Override with e.g. `--once`, `--dry-run`, `--self-test`.

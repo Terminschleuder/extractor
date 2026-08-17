@@ -133,6 +133,21 @@ registry is the extension point. The runner resolves by the source's
 `platform`, falling back to the `llm` default. Add a class, decorate it, and
 it drops in without touching the runner. (Today only `llm` ships, by design.)
 
+## Container images & releases
+
+CI (`.github/workflows/ci.yml`) runs the host-venv test suite and builds the image on
+every push to `main`/`develop`, every tag, and every PR. The image is published to the
+**GitHub Container Registry** only when a commit lands on `main` (an accepted PR, once
+`main` is branch-protected) or a release tag is pushed:
+
+```bash
+docker pull ghcr.io/terminschleuder/extractor:latest
+docker pull ghcr.io/terminschleuder/extractor:0.1alpha
+```
+
+Development follows a `develop` → `main` cycle: work lands on `develop`, PRs to `main`
+build and publish. Direct pushes to `main` are blocked by branch protection.
+
 ## Docs
 
 - [`docs/architecture.md`](docs/architecture.md) — design, components, flow, deployment
