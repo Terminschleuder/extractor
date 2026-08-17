@@ -114,11 +114,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Scan the published image; fail only on fixable CRITICAL vulns.
+      # Scan the published image by its registry ref (buildx pushes straight
+      # to ghcr without loading into the daemon, so the local imageid isn't
+      # scannable; trivy reads the ghcr creds login-action wrote to the docker
+      # config). cache: true caches the vuln DB across runs.
       - name: Trivy scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
-          image-ref: ${{ steps.build.outputs.imageid }}
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: 1
+          cache: true
