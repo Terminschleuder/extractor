@@ -94,6 +94,25 @@ so the container can reach a host-side Ollama at `http://host.docker.internal:11
 
 The host `.venv` exists only for tests — prod always runs in the container.
 
+## CI, releases & images
+
+`.github/workflows/ci.yml` runs two jobs:
+
+- **test** — host-venv pytest plus a non-pushing buildx image build, on every
+  push to `main`/`develop`, every `v*` tag, every PR, and manual
+  `workflow_dispatch` (with an optional `dry_run` input).
+- **release** — gated on pushes (or dispatches) **to `main` only**: computes the
+  next **CalVer** version (`YYYY.MINOR.0`, git tag `vYYYY.MINOR.0`), builds the image
+  for `linux/amd64`, pushes it to **ghcr.io/terminschleuder/extractor** tagged
+  with the CalVer version, `latest`, and `sha-<short>`, scans it with Trivy
+  (CRITICAL, fail the release), and finally creates the git tag + GitHub Release
+  (with source tarballs) — last, so a failed run retries idempotently with the
+  same version. PRs and `develop` pushes never publish.
+
+Deployment therefore never clones this repo — pull the image and run it with
+the ingestion env (`API_KEY`, `API_BASE_URL`, `LLM_BASE_URL`, …; see the README
+env table).
+
 ## Failure handling
 
 - A non-2xx ingestion response raises `ApiError`/`AuthError`; if it happens

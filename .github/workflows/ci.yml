@@ -3,15 +3,24 @@ name: CI
 on:
   push:
     branches: [main, develop]
-    tags: ["v*", "alpha-*", "*alpha"]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: compute version + build image, no push/tag/release"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# PRs and develop pushes may cancel their in-flight predecessors, but a push to
+# main never cancels a running release — it queues behind it (see the job-level
+# release-queue group below).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
   test:
@@ -56,25 +65,55 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Publish the image to ghcr.io only when a commit lands on main (an accepted
-  # PR, once main is branch-protected) or when a release tag is pushed. Develop
-  # pushes and PRs build/test above but never publish.
-  publish:
-    name: Build & publish image
+  # Every accepted change on main (a PR merge or a push) cuts the next CalVer
+  # release (YYYY.MINOR.0, e.g. v2026.1.0): it versions, builds & pushes the
+  # image to ghcr.io, scans it, then creates the git tag + GitHub Release last
+  # (so a failed re-run recomputes the same version and stays idempotent).
+  # PRs and develop pushes build/test above but never release.
+  release:
+    name: Version, publish image & cut release
     needs: test
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: read
-      packages: write
+      contents: write      # create tag + GitHub Release
+      packages: write      # push to ghcr.io
       id-token: write      # for buildx provenance/SLSA attestation
       attestations: write  # to push provenance attestations
       actions: write       # to write the buildx GHA cache
+    concurrency:
+      group: release-queue
+      cancel-in-progress: false   # serialize releases; never kill a publish
 
     steps:
-      - name: Checkout
+      # Full history: the version computation must see all remote tags
+      # (CalVer tags are created here, not locally).
+      - name: Checkout (full history)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version (CalVer YYYY.MINOR.0)
+        id: version
+        run: |
+          set -euo pipefail
+          YEAR=$(date -u +%Y)
+          LATEST=$(git tag -l "v${YEAR}.*" | sort -V | tail -n1)
+          MINOR=0
+          [ -n "$LATEST" ] && MINOR=$(echo "$LATEST" | cut -d. -f2)
+          NEXT="${YEAR}.$((MINOR + 1)).0"
+          # Idempotent re-run: if the tag already exists on THIS commit (a
+          # failed release retried), reuse it rather than skipping a version.
+          if git rev-parse -q --verify "refs/tags/v${NEXT}" >/dev/null; then
+            if [ "$(git rev-parse "v${NEXT}^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::error::tag v${NEXT} already exists on a different commit" >&2
+              exit 1
+            fi
+            echo "Reusing existing tag v${NEXT} for this commit (failed-run retry)."
+          fi
+          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEXT}"     >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -93,20 +132,21 @@ jobs:
           images: ghcr.io/terminschleuder/extractor
           flavor: latest=false
           tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
             type=sha,format=short
           labels: |
             org.opencontainers.image.title=terminschleuder-extractor
             org.opencontainers.image.description=LLM-based extractor for the terminschleuder ingestion API (OpenAI-compatible inference)
             org.opencontainers.image.licenses=Apache-2.0
 
+      # Dry runs (workflow_dispatch with dry_run=true) build but don't push.
       - name: Build & push
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
           provenance: true
           sbom: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -117,8 +157,10 @@ jobs:
       # Scan the published image by its registry ref (buildx pushes straight
       # to ghcr without loading into the daemon, so the local imageid isn't
       # scannable; trivy reads the ghcr creds login-action wrote to the docker
-      # config). cache: true caches the vuln DB across runs.
+      # config). cache: true caches the vuln DB across runs. Skipped on dry
+      # runs (the registry ref only exists after a push).
       - name: Trivy scan
+        if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
@@ -126,3 +168,21 @@ jobs:
           ignore-unfixed: true
           exit-code: 1
           cache: true
+
+      # LAST, deliberately: a failed earlier step re-runs with the same
+      # version and re-pushed tags, then cuts the release — never the reverse
+      # (a published release with no image). gh is preinstalled on the runner;
+      # creating a release for a nonexistent tag also creates the tag at
+      # --target, and the API-attached source tarballs publish the source.
+      - name: Create tag & GitHub Release
+        if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes "Automated CalVer release $VERSION. Image: ghcr.io/terminschleuder/extractor ($VERSION, latest)." \
+            --generate-notes
