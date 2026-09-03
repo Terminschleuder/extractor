@@ -136,19 +136,22 @@ it drops in without touching the runner. (Today only `llm` ships, by design.)
 ## Container images & releases
 
 CI (`.github/workflows/ci.yml`) runs the host-venv test suite and builds the image on
-every push to `main`/`develop`, every tag, and every PR. The image is published to the
-**GitHub Container Registry** only when a commit lands on `main` (an accepted PR, once
-`main` is branch-protected) or a release tag is pushed. For deployment you don't clone this
-repo — **pull the image** and run it with your ingestion env (`API_KEY`, `API_BASE_URL`,
+every push to `main`/`develop`, every `v*` tag, and every PR. When a commit lands on
+`main`, CI cuts the next **CalVer release** (`YYYY.MINOR.0`, starting at `v2026.1.0`):
+it publishes the image to the **GitHub Container Registry** tagged with the version,
+`latest`, and `sha-<short>`, scans it with Trivy, then creates the git tag and a
+GitHub Release (with source tarballs) — automatically. PRs and `develop` pushes build
+and test but never publish. For deployment you don't clone this repo — **pull the
+image** and run it with your ingestion env (`API_KEY`, `API_BASE_URL`,
 `LLM_BASE_URL`, …; see the env table above):
 
 ```bash
 docker pull ghcr.io/terminschleuder/extractor:latest
-docker pull ghcr.io/terminschleuder/extractor:0.3alpha
+docker pull ghcr.io/terminschleuder/extractor:2026.1.0
 ```
 
-Development follows a `develop` → `main` cycle: work lands on `develop`, PRs to `main`
-build and publish. Direct pushes to `main` are blocked by branch protection.
+Releases can be rehearsed without side effects: *Actions → CI → Run workflow* with
+`dry_run` enabled versions and builds but pushes nothing.
 
 ## Docs
 
