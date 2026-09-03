@@ -102,7 +102,7 @@ The host `.venv` exists only for tests — prod always runs in the container.
   push to `main`/`develop`, every `v*` tag, every PR, and manual
   `workflow_dispatch` (with an optional `dry_run` input).
 - **release** — gated on pushes (or dispatches) **to `main` only**: computes the
-  next **CalVer** version (`YYYY.MINOR.0`, git tag `v2026.1.0`), builds the image
+  next **CalVer** version (`YYYY.MINOR.0`, git tag `vYYYY.MINOR.0`), builds the image
   for `linux/amd64`, pushes it to **ghcr.io/terminschleuder/extractor** tagged
   with the CalVer version, `latest`, and `sha-<short>`, scans it with Trivy
   (CRITICAL, fail the release), and finally creates the git tag + GitHub Release
