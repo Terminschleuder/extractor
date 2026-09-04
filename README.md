@@ -159,3 +159,8 @@ Releases can be rehearsed without side effects: *Actions → CI → Run workflow
 - [`docs/llm-extraction.md`](docs/llm-extraction.md) — prompt, tool schema, validation, cost
 
 See [`AGENTS.md`](AGENTS.md) for the contribution invariants (code/tests/README/docs kept in sync).
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE). Third-party libraries and their
+licenses are inventoried in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
