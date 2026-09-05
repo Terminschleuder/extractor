@@ -133,6 +133,57 @@ registry is the extension point. The runner resolves by the source's
 `platform`, falling back to the `llm` default. Add a class, decorate it, and
 it drops in without touching the runner. (Today only `llm` ships, by design.)
 
+## Deploy on a container hoster
+
+For a hoster that runs containers **without docker compose** — an
+app-platform-style UI (deploy by image, per-app env panel) or a plain host where
+you `docker run` yourself. The extractor runs **headless** (no port, no UI): it
+polls approved sources, extracts events with the LLM, and reports them to the
+backend's **public** ingestion API over HTTPS — so it needs no network link to
+any other container, only outbound access to your backend's URL.
+
+| Field | Value |
+|---|---|
+| Image | `ghcr.io/terminschleuder/extractor:<release-version>` (pin it — see below) |
+| Ports | none |
+| Volume (recommended) | one at `/app/state` — crawl timestamps; without it every redeploy re-crawls everything |
+| Links to other containers | **none** — it calls the backend's public URL like any API client |
+
+Env to fill in the panel (full list + defaults in the
+[env table](#configuration-env-vars-prefix-extractor_)):
+
+- **Required:** `EXTRACTOR_API_KEY` (minted in the backend's admin — see the
+  backend's deployment guide), `EXTRACTOR_API_BASE_URL` (your backend's public
+  URL — **the default is the production URL**, change it for any other
+  deployment), `EXTRACTOR_LLM_BASE_URL` (your OpenAI-compatible endpoint —
+  **the default `http://localhost:11434/v1` is unreachable from inside a
+  container**), and the matching `EXTRACTOR_LLM_MODEL` / `EXTRACTOR_LLM_API_KEY`.
+- **Recommended:** `EXTRACTOR_STATE_FILE=/app/state/crawl_state.json` together
+  with the `/app/state` volume.
+- **Optional:** poll/tuning vars from the table (`EXTRACTOR_RUN_MODE`,
+  `EXTRACTOR_POLL_INTERVAL_SECONDS`, …).
+
+Plain-host equivalent of the UI steps above:
+
+```bash
+docker run -d --name ts-extractor --restart unless-stopped \
+  -v ts-state:/app/state \
+  -e EXTRACTOR_API_KEY=<key> \
+  -e EXTRACTOR_API_BASE_URL=https://www.terminschleuder.online \
+  -e EXTRACTOR_LLM_BASE_URL=https://<llm-endpoint>/v1 \
+  -e EXTRACTOR_LLM_MODEL=<model> \
+  -e EXTRACTOR_LLM_API_KEY=<llm-key> \
+  -e EXTRACTOR_STATE_FILE=/app/state/crawl_state.json \
+  ghcr.io/terminschleuder/extractor:<release-version>
+```
+
+Ordering: deploy the extractor **last** — it needs an API key minted in a
+running backend first (onboarding walk-through, including the exec-less
+backoffice path, in the backend's
+[deployment guide](https://github.com/Terminschleuder/backend/blob/main/docs/deployment.md)).
+Nothing is extracted until a source is approved in the backend's admin; watch
+the container logs for a run reporting observations.
+
 ## Container images & releases
 
 CI (`.github/workflows/ci.yml`) runs the host-venv test suite and builds the image on
