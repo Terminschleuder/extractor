@@ -1,7 +1,7 @@
 # terminschleuder-extractor image.
 # Prod runs here; the host venv is only for tests. No GIS/GDAL needed — the
 # backend owns the PostGIS Point; we send latitude/longitude as separate floats.
-FROM python:3.14-slim-bookworm AS base
+FROM python:3.15-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
